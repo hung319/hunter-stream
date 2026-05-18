@@ -4,31 +4,21 @@ import random
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
 from cloakbrowser import launch_async
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-# Global instance variable for sharing the browser engine across requests
 browser_instance = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Lifecycle manager to initialize CloakBrowser engine on startup
-    and gracefully close it on shutdown.
-    """
     global browser_instance
-    print("[INFO] Initializing CloakBrowser Core Engine for Headless Production Server...")
+    print("[INFO] Initializing CloakBrowser Core Engine (Smart Auto-Detect)...")
     try:
-        # Initializing the source-level patched Chromium binary in headless mode
-        browser_instance = await launch_async(
-            headless=True, 
-            humanize=True, 
-            human_preset="default"
-        )
-        print("[INFO] CloakBrowser engine initialized successfully and ready for incoming requests.")
+        browser_instance = await launch_async(headless=True, humanize=True, human_preset="default")
+        print("[INFO] CloakBrowser engine initialized successfully.")
     except Exception as e:
         print(f"[CRITICAL] Failed to initialize CloakBrowser engine: {e}")
         raise e
@@ -39,66 +29,64 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CloakBrowser Stream Extractor API Pro",
-    version="1.2.5",
-    description="Enterprise-grade production API to extract hidden M3U8 and MP4 media streams from highly protected websites.",
-    lifespan=lifespan
+    version="1.5.0",
+    description="High-performance API with Dynamic Content-Type Validation and Auto-Detect.",
+    lifespan=lifespan,
+    redoc_url=None 
 )
 
 # --- REQUEST & RESPONSE MODELS ---
 class ExtractorRequest(BaseModel):
-    url: str = Field(..., description="The target streaming website URL to scan.", example="https://example.com/video/player1")
-    proxy: Optional[str] = Field(None, description="Optional proxy connection string (e.g., socks5://user:pass@host:port or http://host:port).", example="socks5://127.0.0.1:1080")
-    timeout: Optional[int] = Field(15, description="Maximum wait time in seconds for streaming media discovery.", example=15)
-    upload_pastebin: bool = Field(False, description="Whether to automatically upload hidden/blob M3U8 text contents to Pastebin.")
-    fast_exit: bool = Field(True, description="Immediately return response once the first valid media stream is captured.")
+    url: str = Field(..., description="The target streaming website URL to scan.", example="https://example.com/video")
+    proxy: Optional[str] = Field(None, description="Optional proxy connection string (socks5:// or http://).")
+    headers: Optional[Dict[str, str]] = Field(None, description="Custom HTTP Headers to inject.")
+    timeout: Optional[int] = Field(15, description="Maximum wait time in seconds.")
+    upload_pastebin: bool = Field(False, description="Upload M3U8 contents to Pastebin.")
+    fast_exit: bool = Field(True, description="Return immediately once the first stream is found.")
 
 class BatchExtractorRequest(BaseModel):
-    urls: List[str] = Field(..., description="List of target streaming URLs to scan concurrently.")
-    proxy: Optional[str] = Field(None, description="Global proxy connection string used across all parallel instances.")
-    timeout: Optional[int] = Field(15, description="Maximum wait time in seconds for each separate URL scan.")
-    upload_pastebin: bool = Field(False, description="Enable automatic Pastebin uploads for all captured hidden text streams.")
-    fast_exit: bool = Field(True, description="Immediately complete individual scans upon finding the first valid media stream.")
+    urls: List[str] = Field(..., description="List of target URLs to scan concurrently.")
+    proxy: Optional[str] = Field(None, description="Global proxy string.")
+    headers: Optional[Dict[str, str]] = Field(None, description="Custom HTTP Headers to inject for all requests.")
+    timeout: Optional[int] = Field(15, description="Maximum wait time per URL.")
+    upload_pastebin: bool = Field(False, description="Upload hidden contents to Pastebin.")
+    fast_exit: bool = Field(True, description="Return immediately upon finding streams.")
 
 class VideoStream(BaseModel):
-    type: str = Field(..., description="Type of stream discovered (M3U8_NETWORK, MP4_NETWORK, M3U8_HIDDEN, or M3U8_DOM).")
-    url: str = Field(..., description="Direct downloadable or viewable media stream URL.")
-    pastebin_raw: Optional[str] = Field(None, description="Publicly accessible Pastebin raw text URL if upload_pastebin was activated.")
-    content: Optional[str] = Field(None, description="A brief text snippet of the raw payload or method metadata.")
+    type: str = Field(..., description="Type of stream (M3U8_NETWORK, MP4_NETWORK, M3U8_DOM).")
+    url: str = Field(..., description="Direct media stream URL.")
+    headers: Optional[Dict[str, str]] = Field(None, description="Essential request headers to bypass 403.")
+    pastebin_raw: Optional[str] = Field(None, description="Pastebin raw text URL if uploaded.")
+    content: Optional[str] = Field(None, description="Preview of the raw payload.")
 
-# --- NETWORK HELPER FUNCTIONS ---
+# --- HELPERS ---
 async def upload_to_centos_paste(context, text_content: str) -> str:
-    """
-    Uploads raw hidden M3U8 manifests to paste.centos.org for instant extraction access.
-    """
     try:
+        await context.request.get("https://paste.centos.org") 
         resp = await context.request.post(
             "https://paste.centos.org/",
-            form={
-                "name": "stealth-api-extractor",
-                "title": "stream_manifest",
-                "lang": "text",
-                "code": text_content,
-                "expire": "120",  # Link automatically expires in 120 minutes
-                "submit": "submit"
-            }
+            headers={
+                "Referer": "https://paste.centos.org/",
+                "Origin": "https://paste.centos.org",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Upgrade-Insecure-Requests": "1"
+            },
+            form={"name": "api-extractor", "title": "stream", "lang": "text", "code": text_content, "expire": "120", "submit": "submit"}
         )
         html = await resp.text()
         match = re.search(r'<a class="control" href="([^"]*?)">View Raw</a>', html)
         if match:
             raw_uri = match.group(1)
             return raw_uri if raw_uri.startswith("http") else f"https://paste.centos.org{raw_uri}"
-    except Exception as e:
-        print(f"[ERROR] Pastebin data synchronization failed: {e}")
+    except Exception:
+        pass
     return ""
 
 async def force_play_videos(page):
-    """
-    Injects recursive scripts inside the main document and all sub-iframes to force video player initialization.
-    """
     js_code = """() => {
         document.querySelectorAll('video, audio').forEach(v => {
             if (v.paused) {
-                v.muted = true; // Muting is strictly required to bypass modern browser autoplay blocking
+                v.muted = true;
                 const p = v.play();
                 if (p !== undefined) p.catch(() => {});
             }
@@ -107,132 +95,152 @@ async def force_play_videos(page):
     try:
         await page.evaluate(js_code)
         for frame in page.frames:
-            try:
-                await frame.evaluate(js_code)
-            except:
-                pass
-    except:
-        pass
+            try: await frame.evaluate(js_code)
+            except: pass
+    except: pass
 
 async def block_unnecessary_resources(route, request):
-    """
-    Optimizes network traffic and memory footprints by entirely dropping heavy structural design requests.
-    """
     if request.resource_type in ["image", "stylesheet", "font"]:
         await route.abort()
     else:
         await route.continue_()
 
-# --- CORE EXTRACTION ENGINE ---
-async def process_single_url(url: str, proxy: Optional[str], timeout: int, upload_pastebin: bool, fast_exit: bool) -> Dict[str, Any]:
+def extract_player_headers(raw_headers: Dict[str, str]) -> Dict[str, str]:
+    IMPORTANT_KEYS = ["referer", "user-agent", "cookie", "origin", "authorization", "x-requested-with"]
+    return {k: v for k, v in raw_headers.items() if k.lower() in IMPORTANT_KEYS}
+
+# --- CORE ENGINE ---
+async def process_single_url(url: str, proxy: Optional[str], timeout: int, upload_pastebin: bool, fast_exit: bool, custom_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     global browser_instance
     detected_streams: List[VideoStream] = []
     
-    # Static listing of known tracking providers to eliminate network parsing false positives
-    TRACKING_DOMAINS = ["google-analytics.com", "yandex.ru", "doubleclick.net", "facebook.com", "googletagmanager.com", "scorecardresearch.com"]
+    parsed_target = urlparse(url)
+    base_domain = f"{parsed_target.scheme}://{parsed_target.netloc}/"
     
-    context_options = {}
+    stealth_headers = {
+        "Referer": "https://www.google.com/", 
+        "Origin": base_domain[:-1],           
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-User": "?1",
+        "DNT": "1"
+    }
+
+    final_headers = stealth_headers.copy()
+    if custom_headers:
+        normalized_custom = {k.title(): v for k, v in custom_headers.items()}
+        final_headers.update(normalized_custom)
+
+    context_options = {"extra_http_headers": final_headers}
     if proxy:
         context_options["proxy"] = {"server": proxy}
-        context_options["geoip"] = True  # Automatically sync local browser environment details with exit IP
+        context_options["geoip"] = True
 
     try:
-        # Spawning an isolated context session to prevent cookies leak cross requests
         context = await browser_instance.new_context(**context_options)
+        
+        user_provided_referer = custom_headers and any(k.lower() == "referer" for k in custom_headers.keys())
+        if not user_provided_referer:
+            await context.route("**/*", lambda route: route.continue_(headers={
+                **route.request.headers,
+                "Referer": base_domain if parsed_target.netloc in route.request.url else "https://www.google.com/"
+            }))
+
         page = await context.new_page()
         
-        # Interceptive background event loop to block unwanted tab popups and ad redirects
         async def on_new_page(new_page):
             if new_page != page:
-                try:
-                    await new_page.close()
-                    print(f"[POPUP CONTROL] Intercepted and terminated an intrusive advertisement tab for {url}")
-                except Exception:
-                    pass
-        
+                try: await new_page.close()
+                except: pass
         context.on("page", on_new_page)
 
-        # Connect performance optimization route rules
         await page.route("**/*", block_unnecessary_resources)
 
-        # Real-time packet sniffing interceptor loop
+        # 1. SMART NETWORK SNIFFER (AUTO-DETECT VALIDATION)
         async def handle_response(response):
             try:
-                if response.request.method == "OPTIONS": 
-                    return
-                url_str, status = response.url.lower(), response.status
-                parsed_url = urlparse(response.url)
-                netloc = parsed_url.netloc.lower()
-                path = parsed_url.path.lower()
-                
-                # Drop analytics tracking from matching rules
-                if any(domain in netloc for domain in TRACKING_DOMAINS): 
+                # Bỏ qua OPTIONS và các HTTP Status lỗi
+                if response.request.method == "OPTIONS" or response.status not in [200, 206]: 
                     return
                 
-                # Rule 1: Match static file extensions cleanly extracted from raw pathing
-                if path.endswith(".m3u8"):
-                    if not any(s.url == response.url for s in detected_streams):
-                        detected_streams.append(VideoStream(type="M3U8_NETWORK", url=response.url))
-                        print(f"[FOUND] Captured direct M3U8 stream URL: {response.url}")
-                        
-                elif path.endswith(".mp4"):
-                    if not any(s.url == response.url for s in detected_streams):
-                        detected_streams.append(VideoStream(type="MP4_NETWORK", url=response.url))
-                        print(f"[FOUND] Captured direct MP4 stream URL: {response.url}")
-
-                # Rule 2: Intercept content-type responses for obfuscated blobs and XHR text manifests
-                elif status == 200 and "mpegurl" in response.headers.get("content-type", "").lower():
+                # Bỏ qua các loại file rác ngay từ đầu (Tối ưu RAM)
+                if response.request.resource_type in ["image", "stylesheet", "script", "font", "document"]:
+                    return
+                
+                raw_url = response.url
+                path = urlparse(raw_url).path.lower()
+                content_type = response.headers.get("content-type", "").lower()
+                captured_headers = extract_player_headers(response.request.headers)
+                
+                # LAYER 1: KIỂM ĐỊNH MP4 BẰNG CONTENT-TYPE
+                if path.endswith(".mp4") or "video/mp4" in content_type:
+                    # Tracking pixel mp4 thường trả về image/gif hoặc text/html. Phải là video/ hoặc application/octet-stream mới lấy
+                    if "video/" in content_type or "application/octet-stream" in content_type:
+                        if not any(s.url == raw_url for s in detected_streams):
+                            detected_streams.append(VideoStream(type="MP4_NETWORK", url=raw_url, headers=captured_headers))
+                            print(f"[FOUND] Valid MP4 Stream: {raw_url}")
+                
+                # LAYER 2: KIỂM ĐỊNH M3U8 BẰNG CHỮ KÝ FILE (#EXTM3U)
+                elif path.endswith(".m3u8") or path.endswith(".m3u") or "mpegurl" in content_type:
+                    # Đọc nội dung file để đối chiếu chữ ký
                     body_bytes = await response.body()
                     text_content = body_bytes.decode("utf-8", errors="ignore")
-                    if "#EXTM3U" in text_content and not any(s.content and s.content[:50] == text_content[:50] for s in detected_streams):
-                        print(f"[FOUND] Intercepted hidden streaming payload manifest. Syncing...")
-                        paste_link = await upload_to_centos_paste(context, text_content) if upload_pastebin else None
-                        detected_streams.append(VideoStream(
-                            type="M3U8_HIDDEN", 
-                            url="blob_or_hidden", 
-                            pastebin_raw=paste_link, 
-                            content=text_content[:150]
-                        ))
+                    
+                    if "#EXTM3U" in text_content:
+                        # Kiểm tra xem link này đã có trong danh sách chưa
+                        if not any(s.content and s.content[:50] == text_content[:50] for s in detected_streams) and not any(s.url == raw_url for s in detected_streams):
+                            
+                            paste_link = None
+                            # Up Pastebin nếu user yêu cầu
+                            if upload_pastebin:
+                                paste_link = await upload_to_centos_paste(context, text_content)
+                            
+                            stream_type = "M3U8_NETWORK" if raw_url.startswith("http") else "M3U8_HIDDEN"
+                            
+                            detected_streams.append(VideoStream(
+                                type=stream_type, 
+                                url=raw_url if stream_type == "M3U8_NETWORK" else "blob_or_hidden", 
+                                headers=captured_headers, 
+                                pastebin_raw=paste_link, 
+                                content=text_content[:150]
+                            ))
+                            print(f"[FOUND] Valid M3U8 Signature Confirmed: {raw_url}")
             except Exception:
                 pass
 
         page.on("response", handle_response)
         
-        print(f"[STEALTH ACTION] Initiating engine connection to target: {url}")
+        print(f"[PROCESS] Target: {url}")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            await asyncio.sleep(2)  # Static cool down for scripts execution and player mounting
+            await asyncio.sleep(2)
         except PlaywrightTimeoutError:
-            print(f"[WARNING] Navigation timeout reached for {url}. Switching engine to aggressive sniffing mode...")
+            pass
         except Exception as e:
             await context.close()
-            return {"status": "error", "target": url, "message": f"Network unreachable or link dead: {str(e)}"}
+            return {"status": "error", "target": url, "message": str(e)}
 
-        # Targeted Behavioral Clicking Loop to pierce ad layers and force player triggers
+        # Vòng lặp tương tác chuột
         for _ in range(timeout):
-            if fast_exit and len(detected_streams) > 0:
-                print(f"[FAST-EXIT] Stream signature captured for {url}. Terminating worker sequence early.")
-                break
-                
+            if fast_exit and len(detected_streams) > 0: break
             await force_play_videos(page)
-            
             try:
-                # Scrape coordinates for potential media player bounding blocks
                 media_elements = await page.query_selector_all("iframe, video, .play-btn, .plyr, [class*='player']")
                 if media_elements:
                     for el in media_elements:
                         box = await el.bounding_box()
                         if box and box["width"] > 50 and box["height"] > 50:
-                            target_x = box["x"] + box["width"] / 2
-                            target_y = box["y"] + box["height"] / 2
-                            
-                            # Move mouse randomly to clear behavioral tripwires, then click target
-                            await page.mouse.move(target_x + random.randint(-50, 50), target_y + random.randint(-50, 50))
-                            await page.mouse.click(target_x, target_y)
+                            tx = box["x"] + box["width"] / 2
+                            ty = box["y"] + box["height"] / 2
+                            await page.mouse.move(tx + random.randint(-50, 50), ty + random.randint(-50, 50))
+                            await page.mouse.click(tx, ty)
                             await asyncio.sleep(0.1)
-                            await page.mouse.click(target_x, target_y + random.randint(-15, 15))
+                            await page.mouse.click(tx, ty + random.randint(-15, 15))
                 else:
-                    # Fallback coordinate center clicking sequence
                     viewport = page.viewport_size
                     if viewport:
                         cx, cy = viewport["width"] / 2, viewport["height"] / 2
@@ -240,98 +248,64 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
                         await page.mouse.click(cx, cy)
                         await asyncio.sleep(0.1)
                         await page.mouse.click(cx, cy + random.randint(-15, 15))
-            except Exception:
-                pass
-            
+            except: pass
             await asyncio.sleep(1)
 
-        # Fallback Deep DOM Scanner Layer (Mimicking Userscript string pattern analysis)
+        # 2. DOM SCANNER FALLBACK
         if len(detected_streams) == 0 or not fast_exit:
             try:
-                print(f"[SCANNER] Initiating Deep DOM fallback scan for {url}...")
                 html_content = await page.content()
                 m3u8_pattern = re.compile(r"(https?://[^\s\"\'<>]+\.m3u8[^\s\"\'<>]*)", re.IGNORECASE)
                 for match_url in m3u8_pattern.findall(html_content):
                     clean_url = match_url.replace("\\/", "/")
                     if not any(s.url == clean_url for s in detected_streams):
-                        detected_streams.append(VideoStream(
-                            type="M3U8_DOM", 
-                            url=clean_url, 
-                            content="Extracted directly from HTML/JS source patterns via RegEx matching."
-                        ))
-                        print(f"[FOUND] Fallback DOM scanner successfully mapped stream URL: {clean_url}")
-            except Exception as e:
-                print(f"[WARNING] Fallback document schema scan failed: {e}")
+                        main_headers = {"User-Agent": await page.evaluate("navigator.userAgent"), "Referer": url}
+                        detected_streams.append(VideoStream(type="M3U8_DOM", url=clean_url, headers=main_headers))
+            except: pass
 
         await page.close()
         await context.close()
-
-        return {
-            "status": "success",
-            "target": url,
-            "total_found": len(detected_streams),
-            "streams": detected_streams
-        }
+        return {"status": "success", "target": url, "total_found": len(detected_streams), "streams": detected_streams}
 
     except Exception as e:
-        if 'context' in locals(): 
-            await context.close()
-        return {"status": "error", "target": url, "message": f"Execution processing error: {str(e)}"}
+        if 'context' in locals(): await context.close()
+        return {"status": "error", "target": url, "message": str(e)}
 
-# --- ROUTER ENDPOINTS ---
-
-@app.post(
-    "/api/v1/extract", 
-    response_model=dict, 
-    tags=["Scraper Core"],
-    summary="Extract stream links from a single URL",
-    description="Launches an isolated headless stealth tab session to intercept network traffic and click player elements."
-)
-async def extract_one(payload: ExtractorRequest):
-    if not browser_instance: 
-        raise HTTPException(status_code=500, detail="Browser core engine is uninitialized.")
-    return await process_single_url(payload.url, payload.proxy, payload.timeout, payload.upload_pastebin, payload.fast_exit)
-
-@app.post(
-    "/api/v1/extract-batch", 
-    response_model=dict, 
-    tags=["Scraper Core"],
-    summary="Extract stream links from multiple URLs concurrently",
-    description="Processes a collection of URLs concurrently utilizing non-blocking asynchronous event-driven workers."
-)
-async def extract_batch(payload: BatchExtractorRequest):
-    if not browser_instance: 
-        raise HTTPException(status_code=500, detail="Browser core engine is uninitialized.")
-    
-    print(f"[BATCH PIPELINE] Executing parallel extraction threads for {len(payload.urls)} targets...")
-    tasks = [
-        process_single_url(u, payload.proxy, payload.timeout, payload.upload_pastebin, payload.fast_exit) 
-        for u in payload.urls
-    ]
-    results = await asyncio.gather(*tasks)
+# --- ENDPOINTS ---
+@app.get("/api/v1/ai-docs", tags=["AI Documentation"])
+async def ai_documentation():
     return {
-        "status": "success",
-        "total_urls": len(payload.urls),
-        "results": results
+        "api_purpose": "Extract direct video stream links (M3U8/MP4) from protected web players.",
+        "endpoints": [
+            {
+                "path": "/api/v1/extract",
+                "method": "POST",
+                "payload_schema": {
+                    "url": "string (required)",
+                    "proxy": "string (optional)",
+                    "headers": "object (optional) - Custom HTTP headers",
+                    "timeout": "integer (optional, default 15)",
+                    "upload_pastebin": "boolean (optional, default false)",
+                    "fast_exit": "boolean (optional, default true)"
+                }
+            }
+        ]
     }
 
-@app.get("/api/v1/health", tags=["System Utilities"], summary="System Performance Health Status Check")
-async def health_check():
-    if browser_instance:
-        return {"status": "healthy", "engine": "CloakBrowser Node Engine Active"}
-    return {"status": "unhealthy", "engine": "Disconnected"}
+@app.post("/api/v1/extract", tags=["Scraper Core"])
+async def extract_one(payload: ExtractorRequest):
+    if not browser_instance: raise HTTPException(status_code=500, detail="Browser error")
+    return await process_single_url(payload.url, payload.proxy, payload.timeout, payload.upload_pastebin, payload.fast_exit, payload.headers)
 
-# --- OPENAPI SPEC GENERATOR ---
+@app.post("/api/v1/extract-batch", tags=["Scraper Core"])
+async def extract_batch(payload: BatchExtractorRequest):
+    if not browser_instance: raise HTTPException(status_code=500, detail="Browser error")
+    tasks = [process_single_url(u, payload.proxy, payload.timeout, payload.upload_pastebin, payload.fast_exit, payload.headers) for u in payload.urls]
+    results = await asyncio.gather(*tasks)
+    return {"status": "success", "total_urls": len(payload.urls), "results": results}
+
 def custom_openapi():
-    if app.openapi_schema: 
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title="CloakBrowser Media Extractor Service Pro",
-        version="1.2.5",
-        description="Enterprise automation routing gateway built with FastAPI to extract protected digital stream assets cleanly.",
-        routes=app.routes,
-    )
-    app.openapi_schema = openapi_schema
+    if app.openapi_schema: return app.openapi_schema
+    app.openapi_schema = get_openapi(title="CloakBrowser Extractor API", version="1.5.0", routes=app.routes)
     return app.openapi_schema
-
 app.openapi = custom_openapi
