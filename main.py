@@ -27,11 +27,10 @@ async def lifespan(app: FastAPI):
         print("[INFO] Shutting down CloakBrowser engine smoothly...")
         await browser_instance.close()
 
-# Cấu hình gỡ bỏ hoàn toàn ReDoc theo yêu cầu
 app = FastAPI(
     title="CloakBrowser Stream Extractor API Pro",
-    version="1.5.5",
-    description="Enterprise API with strict HTTP Error Mapping (403, 404, 504) for streaming assets extraction.",
+    version="1.6.0",
+    description="Enterprise API with Deep Error Inspection (Bot's Eyes) for 403/404 debugging.",
     lifespan=lifespan,
     redoc_url=None 
 )
@@ -110,11 +109,12 @@ def extract_player_headers(raw_headers: Dict[str, str]) -> Dict[str, str]:
     IMPORTANT_KEYS = ["referer", "user-agent", "cookie", "origin", "authorization", "x-requested-with"]
     return {k: v for k, v in raw_headers.items() if k.lower() in IMPORTANT_KEYS}
 
-# --- CORE ENGINE WITH DYNAMIC HTTP ERROR MAPPING ---
+# --- CORE ENGINE ---
 async def process_single_url(url: str, proxy: Optional[str], timeout: int, upload_pastebin: bool, fast_exit: bool, custom_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     global browser_instance
     detected_streams: List[VideoStream] = []
     is_timeout_triggered = False
+    main_status = 0
     
     parsed_target = urlparse(url)
     base_domain = f"{parsed_target.scheme}://{parsed_target.netloc}/"
@@ -158,7 +158,6 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
 
         await page.route("**/*", block_unnecessary_resources)
 
-        # NETWORK SNIFFER
         async def handle_response(response):
             try:
                 if response.request.method == "OPTIONS" or response.status not in [200, 206]: return
@@ -177,12 +176,10 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
                 elif path.endswith(".m3u8") or path.endswith(".m3u") or "mpegurl" in content_type:
                     body_bytes = await response.body()
                     text_content = body_bytes.decode("utf-8", errors="ignore")
-                    
                     if "#EXTM3U" in text_content:
                         if not any(s.content and s.content[:50] == text_content[:50] for s in detected_streams) and not any(s.url == raw_url for s in detected_streams):
                             paste_link = await upload_to_centos_paste(context, text_content) if upload_pastebin else None
                             stream_type = "M3U8_NETWORK" if raw_url.startswith("http") else "M3U8_HIDDEN"
-                            
                             detected_streams.append(VideoStream(
                                 type=stream_type, url=raw_url if stream_type == "M3U8_NETWORK" else "blob_or_hidden", 
                                 headers=captured_headers, pastebin_raw=paste_link, content=text_content[:150]
@@ -194,16 +191,16 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
         
         print(f"[PROCESS] Target: {url}")
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            referer_to_use = final_headers.get("Referer", "https://www.google.com/")
+            main_response = await page.goto(url, referer=referer_to_use, wait_until="domcontentloaded", timeout=timeout * 1000)
+            main_status = main_response.status if main_response else 0
             await asyncio.sleep(2)
         except PlaywrightTimeoutError:
             is_timeout_triggered = True
-            print(f"[WARN] Page navigation timeout for {url}.")
         except Exception as e:
             await context.close()
-            return {"status": "error", "http_code": 404, "target": url, "message": f"Link dead or network unreachable: {str(e)}"}
+            return {"status": "error", "http_code": 404, "target": url, "message": f"Network error: {str(e)}"}
 
-        # Vòng lặp tương tác chuột
         for _ in range(timeout):
             if fast_exit and len(detected_streams) > 0: break
             await force_play_videos(page)
@@ -230,7 +227,6 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
             except: pass
             await asyncio.sleep(1)
 
-        # DOM SCANNER FALLBACK
         if len(detected_streams) == 0 or not fast_exit:
             try:
                 html_content = await page.content()
@@ -242,25 +238,35 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
                         detected_streams.append(VideoStream(type="M3U8_DOM", url=clean_url, headers=main_headers))
             except: pass
 
-        # === PHÂN TÍCH VÀ ĐỊNH DANH MÃ LỖI HTTP CHUẨN XÁC ===
+        # === DEEP ERROR INSPECTION (MẮT THẦN) ===
         if len(detected_streams) == 0:
-            # Kiểm tra xem có phải bị chặn bởi hệ thống phòng thủ Anti-bot/Cloudflare không
+            page_title = "Unknown"
+            page_snippet = ""
             try:
-                title = await page.title()
-                content = await page.content()
-                if "cloudflare" in title.lower() or "captcha" in content.lower() or "just a moment" in title.lower():
-                    await page.close()
-                    await context.close()
-                    return {"status": "error", "http_code": 403, "target": url, "message": "Access Denied: Protected by Cloudflare or Anti-Bot challenge (403 Forbidden)."}
+                page_title = await page.title()
+                # Cạo lấy 200 chữ đầu tiên hiển thị trên giao diện (bỏ tag HTML)
+                plain_text = await page.evaluate("document.body.innerText")
+                page_snippet = plain_text[:200].replace('\n', ' ').strip()
             except: pass
 
             await page.close()
             await context.close()
-            
+
+            # 1. Phát hiện chặn Anti-bot
+            if "cloudflare" in page_title.lower() or "just a moment" in page_title.lower() or "attention required" in page_title.lower():
+                return {"status": "error", "http_code": 403, "target": url, "message": f"Blocked by Cloudflare/WAF. Page Title: {page_title}"}
+
+            # 2. Phát hiện lỗi Server (404, 500) do trang web chết
+            if main_status >= 400:
+                 return {"status": "error", "http_code": main_status, "target": url, "message": f"Website returned HTTP {main_status}. Page Title: {page_title}. Snippet: {page_snippet}..."}
+
+            # 3. Quá tải mạng
             if is_timeout_triggered:
-                return {"status": "error", "http_code": 504, "target": url, "message": "Gateway Timeout: The website took too long to respond (504)."}
-            else:
-                return {"status": "error", "http_code": 404, "target": url, "message": "Not Found: No valid streaming sources (M3U8/MP4) discovered on this page (404)."}
+                return {"status": "error", "http_code": 504, "target": url, "message": f"Website Timeout. Title seen: {page_title}"}
+
+            # 4. TRƯỜNG HỢP MÙ THÔNG TIN (Trang web tải thành công 200 OK nhưng không có link)
+            # In thẳng những dòng chữ mà con Bot nhìn thấy ra ngoài để bạn đọc
+            return {"status": "error", "http_code": 404, "target": url, "message": f"No streams found. The bot sees this text on screen: '{page_snippet}...'. Title: '{page_title}'"}
 
         await page.close()
         await context.close()
@@ -268,37 +274,25 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
 
     except Exception as e:
         if 'context' in locals(): await context.close()
-        return {"status": "error", "http_code": 500, "target": url, "message": f"Internal Server Error during scraping execution: {str(e)}"}
+        return {"status": "error", "http_code": 500, "target": url, "message": f"Execution error: {str(e)}"}
 
 # --- ENDPOINTS ---
-
 @app.post("/api/v1/extract", tags=["Scraper Core"])
 async def extract_one(payload: ExtractorRequest):
     if not browser_instance: raise HTTPException(status_code=500, detail="Browser error")
-    
     result = await process_single_url(payload.url, payload.proxy, payload.timeout, payload.upload_pastebin, payload.fast_exit, payload.headers)
-    
-    # Ném lỗi HTTP thật về cho Client dựa trên phân tích tầng lõi
-    if result["status"] == "error":
-        raise HTTPException(status_code=result["http_code"], detail=result["message"])
-        
+    if result["status"] == "error": raise HTTPException(status_code=result["http_code"], detail=result["message"])
     return result
 
 @app.post("/api/v1/extract-batch", tags=["Scraper Core"])
 async def extract_batch(payload: BatchExtractorRequest):
     if not browser_instance: raise HTTPException(status_code=500, detail="Browser error")
-    
     tasks = [process_single_url(u, payload.proxy, payload.timeout, payload.upload_pastebin, payload.fast_exit, payload.headers) for u in payload.urls]
     results = await asyncio.gather(*tasks)
-    
-    return {
-        "status": "success",
-        "total_urls": len(payload.urls),
-        "results": results
-    }
+    return {"status": "success", "total_urls": len(payload.urls), "results": results}
 
 def custom_openapi():
     if app.openapi_schema: return app.openapi_schema
-    app.openapi_schema = get_openapi(title="CloakBrowser Extractor API", version="1.5.5", routes=app.routes)
+    app.openapi_schema = get_openapi(title="CloakBrowser Extractor API", version="1.6.0", routes=app.routes)
     return app.openapi_schema
 app.openapi = custom_openapi
