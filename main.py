@@ -15,7 +15,7 @@ browser_instance = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global browser_instance
-    print("[INFO] Initializing CloakBrowser Core Engine for Headless Server...")
+    print("[INFO] Initializing CloakBrowser Core Engine (Iframe Wrapper & Framebuster Bypass)...")
     try:
         browser_instance = await launch_async(headless=True, humanize=True, human_preset="default")
         print("[INFO] CloakBrowser engine initialized successfully.")
@@ -29,8 +29,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CloakBrowser Stream Extractor API Pro",
-    version="1.6.0",
-    description="Enterprise API with Deep Error Inspection (Bot's Eyes) for 403/404 debugging.",
+    version="1.7.0",
+    description="Enterprise API with Iframe Wrapper logic to bypass strict Framebusters and Hotlink protections.",
     lifespan=lifespan,
     redoc_url=None 
 )
@@ -38,7 +38,7 @@ app = FastAPI(
 # --- REQUEST & RESPONSE MODELS ---
 class ExtractorRequest(BaseModel):
     url: str = Field(..., description="The target streaming website URL to scan.", example="https://example.com/video")
-    proxy: Optional[str] = Field(None, description="Optional proxy connection string (socks5:// or http://).")
+    proxy: Optional[str] = Field(None, description="Optional proxy connection string.")
     headers: Optional[Dict[str, str]] = Field(None, description="Custom HTTP Headers to inject.")
     timeout: Optional[int] = Field(15, description="Maximum wait time in seconds.")
     upload_pastebin: bool = Field(False, description="Upload hidden M3U8 blob contents to Pastebin.")
@@ -99,12 +99,6 @@ async def force_play_videos(page):
             except: pass
     except: pass
 
-async def block_unnecessary_resources(route, request):
-    if request.resource_type in ["image", "stylesheet", "font"]:
-        await route.abort()
-    else:
-        await route.continue_()
-
 def extract_player_headers(raw_headers: Dict[str, str]) -> Dict[str, str]:
     IMPORTANT_KEYS = ["referer", "user-agent", "cookie", "origin", "authorization", "x-requested-with"]
     return {k: v for k, v in raw_headers.items() if k.lower() in IMPORTANT_KEYS}
@@ -119,35 +113,21 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
     parsed_target = urlparse(url)
     base_domain = f"{parsed_target.scheme}://{parsed_target.netloc}/"
     
-    stealth_headers = {
-        "Referer": "https://www.google.com/", 
-        "Origin": base_domain[:-1],           
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Upgrade-Insecure-Requests": "1",
-        "DNT": "1"
-    }
-
-    final_headers = stealth_headers.copy()
+    # Tính toán Parent URL (URL giả mạo làm khung chứa)
+    parent_url = "https://www.google.com/"
     if custom_headers:
-        normalized_custom = {k.title(): v for k, v in custom_headers.items()}
-        final_headers.update(normalized_custom)
+        for k, v in custom_headers.items():
+            if k.lower() == "referer":
+                parent_url = v
+                break
 
-    context_options = {"extra_http_headers": final_headers}
+    context_options = {}
     if proxy:
         context_options["proxy"] = {"server": proxy}
         context_options["geoip"] = True
 
     try:
         context = await browser_instance.new_context(**context_options)
-        
-        user_provided_referer = custom_headers and any(k.lower() == "referer" for k in custom_headers.keys())
-        if not user_provided_referer:
-            await context.route("**/*", lambda route: route.continue_(headers={
-                **route.request.headers,
-                "Referer": base_domain if parsed_target.netloc in route.request.url else "https://www.google.com/"
-            }))
-
         page = await context.new_page()
         
         async def on_new_page(new_page):
@@ -156,8 +136,50 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
                 except: pass
         context.on("page", on_new_page)
 
-        await page.route("**/*", block_unnecessary_resources)
+        # === ĐỘ LẠI BỘ ĐỊNH TUYẾN MẠNG (UNIVERSAL STEALTH ROUTE) ===
+        async def universal_route(route, request):
+            req_url = request.url
 
+            # 1. Chặn tài nguyên rác
+            if request.resource_type in ["image", "stylesheet", "font"]:
+                await route.abort()
+                return
+
+            # 2. IFRAME WRAPPER: Nếu duyệt vào Parent URL -> Dựng khung Iframe chứa link phim!
+            if req_url == parent_url and request.resource_type == "document":
+                html_body = f"""
+                <html>
+                <body style='margin:0;overflow:hidden;'>
+                    <iframe src='{url}' style='width:100vw;height:100vh;border:none;' allow='autoplay; fullscreen'></iframe>
+                </body>
+                </html>
+                """
+                await route.fulfill(status=200, content_type="text/html", body=html_body)
+                return
+
+            # 3. Ép Custom Headers
+            headers = request.headers.copy()
+            if custom_headers:
+                for k, v in custom_headers.items():
+                    headers[k.lower()] = v
+
+            # 4. THÁO GIÁP BẢO VỆ CỦA WEB: Xóa X-Frame-Options để cho phép nhúng Iframe
+            if request.resource_type in ["document", "sub_document"]:
+                try:
+                    response = await route.fetch(headers=headers)
+                    res_headers = response.headers
+                    res_headers.pop("x-frame-options", None)
+                    res_headers.pop("content-security-policy", None)
+                    await route.fulfill(response=response, headers=res_headers)
+                    return
+                except Exception:
+                    pass
+
+            await route.continue_(headers=headers)
+
+        await context.route("**/*", universal_route)
+
+        # Mắt thần: Bắt link M3U8 từ Iframe con
         async def handle_response(response):
             try:
                 if response.request.method == "OPTIONS" or response.status not in [200, 206]: return
@@ -189,10 +211,10 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
 
         page.on("response", handle_response)
         
-        print(f"[PROCESS] Target: {url}")
+        print(f"[PROCESS] Target: {url} (Wrapped in {parent_url})")
         try:
-            referer_to_use = final_headers.get("Referer", "https://www.google.com/")
-            main_response = await page.goto(url, referer=referer_to_use, wait_until="domcontentloaded", timeout=timeout * 1000)
+            # QUAN TRỌNG: Bot sẽ truy cập vào Parent URL (Khung giả mạo), không truy cập trực tiếp URL phim
+            main_response = await page.goto(parent_url, wait_until="domcontentloaded", timeout=timeout * 1000)
             main_status = main_response.status if main_response else 0
             await asyncio.sleep(2)
         except PlaywrightTimeoutError:
@@ -201,71 +223,53 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
             await context.close()
             return {"status": "error", "http_code": 404, "target": url, "message": f"Network error: {str(e)}"}
 
+        # Vòng lặp Click: Vì Iframe bọc full màn hình, click vào tâm màn hình là click trúng Video!
         for _ in range(timeout):
             if fast_exit and len(detected_streams) > 0: break
             await force_play_videos(page)
             try:
-                media_elements = await page.query_selector_all("iframe, video, .play-btn, .plyr, [class*='player']")
-                if media_elements:
-                    for el in media_elements:
-                        box = await el.bounding_box()
-                        if box and box["width"] > 50 and box["height"] > 50:
-                            tx = box["x"] + box["width"] / 2
-                            ty = box["y"] + box["height"] / 2
-                            await page.mouse.move(tx + random.randint(-50, 50), ty + random.randint(-50, 50))
-                            await page.mouse.click(tx, ty)
-                            await asyncio.sleep(0.1)
-                            await page.mouse.click(tx, ty + random.randint(-15, 15))
-                else:
-                    viewport = page.viewport_size
-                    if viewport:
-                        cx, cy = viewport["width"] / 2, viewport["height"] / 2
-                        await page.mouse.move(cx + random.randint(-100, 100), cy + random.randint(-100, 100))
-                        await page.mouse.click(cx, cy)
-                        await asyncio.sleep(0.1)
-                        await page.mouse.click(cx, cy + random.randint(-15, 15))
+                viewport = page.viewport_size
+                if viewport:
+                    cx, cy = viewport["width"] / 2, viewport["height"] / 2
+                    await page.mouse.move(cx + random.randint(-50, 50), cy + random.randint(-50, 50))
+                    await page.mouse.click(cx, cy)
+                    await asyncio.sleep(0.1)
+                    await page.mouse.click(cx, cy + random.randint(-15, 15))
             except: pass
             await asyncio.sleep(1)
 
         if len(detected_streams) == 0 or not fast_exit:
             try:
-                html_content = await page.content()
-                m3u8_pattern = re.compile(r"(https?://[^\s\"\'<>]+\.m3u8[^\s\"\'<>]*)", re.IGNORECASE)
-                for match_url in m3u8_pattern.findall(html_content):
-                    clean_url = match_url.replace("\\/", "/")
-                    if not any(s.url == clean_url for s in detected_streams):
-                        main_headers = {"User-Agent": await page.evaluate("navigator.userAgent"), "Referer": url}
-                        detected_streams.append(VideoStream(type="M3U8_DOM", url=clean_url, headers=main_headers))
+                for frame in page.frames:
+                    html_content = await frame.content()
+                    m3u8_pattern = re.compile(r"(https?://[^\s\"\'<>]+\.m3u8[^\s\"\'<>]*)", re.IGNORECASE)
+                    for match_url in m3u8_pattern.findall(html_content):
+                        clean_url = match_url.replace("\\/", "/")
+                        if not any(s.url == clean_url for s in detected_streams):
+                            detected_streams.append(VideoStream(type="M3U8_DOM", url=clean_url, headers={"Referer": parent_url}))
             except: pass
 
-        # === DEEP ERROR INSPECTION (MẮT THẦN) ===
         if len(detected_streams) == 0:
             page_title = "Unknown"
             page_snippet = ""
             try:
-                page_title = await page.title()
-                # Cạo lấy 200 chữ đầu tiên hiển thị trên giao diện (bỏ tag HTML)
-                plain_text = await page.evaluate("document.body.innerText")
-                page_snippet = plain_text[:200].replace('\n', ' ').strip()
+                # Đọc nội dung từ Frame con (chứa video thực sự) thay vì Frame mẹ
+                for frame in page.frames:
+                    if url in frame.url:
+                        page_title = await frame.title()
+                        plain_text = await frame.evaluate("document.body.innerText")
+                        page_snippet = plain_text[:200].replace('\n', ' ').strip()
             except: pass
 
             await page.close()
             await context.close()
 
-            # 1. Phát hiện chặn Anti-bot
-            if "cloudflare" in page_title.lower() or "just a moment" in page_title.lower() or "attention required" in page_title.lower():
+            if "cloudflare" in page_title.lower() or "just a moment" in page_title.lower():
                 return {"status": "error", "http_code": 403, "target": url, "message": f"Blocked by Cloudflare/WAF. Page Title: {page_title}"}
 
-            # 2. Phát hiện lỗi Server (404, 500) do trang web chết
-            if main_status >= 400:
-                 return {"status": "error", "http_code": main_status, "target": url, "message": f"Website returned HTTP {main_status}. Page Title: {page_title}. Snippet: {page_snippet}..."}
-
-            # 3. Quá tải mạng
             if is_timeout_triggered:
                 return {"status": "error", "http_code": 504, "target": url, "message": f"Website Timeout. Title seen: {page_title}"}
 
-            # 4. TRƯỜNG HỢP MÙ THÔNG TIN (Trang web tải thành công 200 OK nhưng không có link)
-            # In thẳng những dòng chữ mà con Bot nhìn thấy ra ngoài để bạn đọc
             return {"status": "error", "http_code": 404, "target": url, "message": f"No streams found. The bot sees this text on screen: '{page_snippet}...'. Title: '{page_title}'"}
 
         await page.close()
@@ -293,6 +297,6 @@ async def extract_batch(payload: BatchExtractorRequest):
 
 def custom_openapi():
     if app.openapi_schema: return app.openapi_schema
-    app.openapi_schema = get_openapi(title="CloakBrowser Extractor API", version="1.6.0", routes=app.routes)
+    app.openapi_schema = get_openapi(title="CloakBrowser Extractor API", version="1.7.0", routes=app.routes)
     return app.openapi_schema
 app.openapi = custom_openapi
