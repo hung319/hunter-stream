@@ -2,37 +2,17 @@ import asyncio
 import re
 import random
 from urllib.parse import urlparse
-from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
-from cloakbrowser import launch_async
+from cloakbrowser import launch_context_async
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
-browser_instance = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global browser_instance
-    print("[INFO] Initializing CloakBrowser Core Engine (Production Final)...")
-    try:
-        # Chạy ẩn không giao diện (Headless) cho Server
-        browser_instance = await launch_async(headless=True, humanize=True, human_preset="default")
-        print("[INFO] CloakBrowser engine initialized successfully.")
-    except Exception as e:
-        print(f"[CRITICAL] Failed to initialize CloakBrowser engine: {e}")
-        raise e
-    yield
-    if browser_instance:
-        print("[INFO] Shutting down CloakBrowser engine smoothly...")
-        await browser_instance.close()
 
 app = FastAPI(
     title="CloakBrowser Stream Extractor API Pro",
     version="2.0.0",
     description="Ultimate API with Auto-Detect, Iframe Wrapper, Header Spoofing, and Deep Error Inspection.",
-    lifespan=lifespan,
     redoc_url=None 
 )
 
@@ -108,7 +88,6 @@ def extract_player_headers(raw_headers: Dict[str, str]) -> Dict[str, str]:
 
 # --- CORE ENGINE ---
 async def process_single_url(url: str, proxy: Optional[str], timeout: int, upload_pastebin: bool, fast_exit: bool, custom_headers: Optional[Dict[str, str]] = None, wrap_iframe: bool = False) -> Dict[str, Any]:
-    global browser_instance
     detected_streams: List[VideoStream] = []
     is_timeout_triggered = False
     main_status = 0
@@ -138,13 +117,15 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
         normalized_custom = {k.title(): v for k, v in custom_headers.items()}
         final_headers.update(normalized_custom)
 
-    context_options = {"extra_http_headers": final_headers}
-    if proxy:
-        context_options["proxy"] = {"server": proxy}
-        context_options["geoip"] = True
-
     try:
-        context = await browser_instance.new_context(**context_options)
+        context = await launch_context_async(
+            headless=True,
+            humanize=True,
+            human_preset="default",
+            proxy=proxy,
+            geoip=bool(proxy),
+            extra_http_headers=final_headers,
+        )
         page = await context.new_page()
         
         # Trình diệt Popup Tab
@@ -324,14 +305,12 @@ async def process_single_url(url: str, proxy: Optional[str], timeout: int, uploa
 # --- ENDPOINTS ---
 @app.post("/api/v1/extract", tags=["Scraper Core"])
 async def extract_one(payload: ExtractorRequest):
-    if not browser_instance: raise HTTPException(status_code=500, detail="Browser error")
     result = await process_single_url(payload.url, payload.proxy, payload.timeout, payload.upload_pastebin, payload.fast_exit, payload.headers, payload.wrap_iframe)
     if result["status"] == "error": raise HTTPException(status_code=result["http_code"], detail=result["message"])
     return result
 
 @app.post("/api/v1/extract-batch", tags=["Scraper Core"])
 async def extract_batch(payload: BatchExtractorRequest):
-    if not browser_instance: raise HTTPException(status_code=500, detail="Browser error")
     tasks = [process_single_url(u, payload.proxy, payload.timeout, payload.upload_pastebin, payload.fast_exit, payload.headers, payload.wrap_iframe) for u in payload.urls]
     results = await asyncio.gather(*tasks)
     return {"status": "success", "total_urls": len(payload.urls), "results": results}
